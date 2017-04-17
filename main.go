@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"log"
 	"os"
 	"time"
@@ -10,7 +11,11 @@ import (
 	"html/template"
 	"io/ioutil"
 	"net/http"
-
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
+	"goji.io/pat"
+	"goji.io"
+	"fmt"
 )
 
 type Stat struct {
@@ -23,15 +28,15 @@ type Stat struct {
 }
 
 func (s Stat) Validate() error {
-	var err error
 	//Verify hash
 	//Hash should be non-empty & 64
 	if s.Hash == "" {
 		return errors.New("Invalid device hash")
 	}
-	if _, err = hex.DecodeString(s.Hash); err != nil {
+	if _, err := hex.DecodeString(s.Hash); err != nil {
 		return errors.New("Device hash is invalid")
 	}
+	//Everything else should just be non-empty.
 	if s.Name == "" {
 		return errors.New("Invalid device model name")
 	}
@@ -50,35 +55,64 @@ func (s Stat) Validate() error {
 	return nil
 }
 
-func statsHandler(w http.ResponseWriter, req *http.Request) {
-	if req.Method != "POST" {
-		http.Error(w, "", http.StatusMethodNotAllowed)
+func addStat(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, req * http.Request) {
+		session := s.Copy()
+		defer session.Close()
+
+		statistic := session.DB("stats").C("statistic")
+		aggregate := session.DB("stats").C("aggregate")
+
+
+		body, err := ioutil.ReadAll(req.Body)
+		if err != nil {
+			//Failed reading body, this shouldn't happen ever.
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		var s Stat
+		err = json.Unmarshal(body, &s)
+
+		if err != nil {
+			//Internal unmarshal error. Shouldn't hit, even with malformed JSON
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		err = s.Validate()
+		if err != nil {
+			//Bad request (json malformed, bad data, etc)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		err = aggregate.Update(bson.M{"hash": s.Hash}, &s)
+		if err != nil {
+			//Failed to update aggregate. Falls into one of two cases:
+			//1. Mongo problem. Bad data, bad data types, etc.
+			//2. Doesn't exist. We need to create it.
+			switch err {
+			default:
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			case mgo.ErrNotFound:
+				err = aggregate.Insert(&s)
+				if err != nil {
+					//We tried to create it, and failed. Falls back to #1 above.
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
+		}
+		err = statistic.Insert(&s)
+		if err != nil {
+			///Mongo problem. Return error.
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		return
 	}
-	//return req.Method
-	body, err := ioutil.ReadAll(req.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var s Stat
-	err = json.Unmarshal(body, &s)
-
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	err = s.Validate()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	return
-}
-
-func mainHandler(w http.ResponseWriter, req *http.Request) {
-
 }
 
 type Thing struct {
@@ -122,10 +156,21 @@ func render_templates() error {
 }
 
 func main() {
+
+	portPtr := flag.Int("port", 8080, "port to launch on (default 8080")
+	mUrlPtr := flag.String("mongo_url", "localhost", "Mongo url string (default localhost)")
+
 	render_templates()
-	http.HandleFunc("/api/v1/stats", statsHandler)
-	http.HandleFunc("/", mainHandler)
-	log.Print("foobar")
+	session, err := mgo.Dial(*mUrlPtr)
+	if err != nil {
+		panic(err)
+	}
+	defer session.Close()
+
+	mux := goji.NewMux()
+	mux.HandleFunc(pat.Post("/api/v1/stats"), addStat(session))
+
+	//Please see README for explanation.
 	ticker := time.NewTicker(1 * time.Second)
 	quit := make(chan struct{})
 	go func() {
@@ -145,5 +190,5 @@ func main() {
 		}
 	}()
 	log.Print("Starting HTTP")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *portPtr), nil))
 }
